@@ -1,0 +1,284 @@
+name: Desktop CI and release
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Expected a vX.Y.Z tag, got $tag" >&2; exit 1; }
+          version="${tag#v}"
+          node -e 'for (const f of ["desktop/package.json", "live/package.json"]) { const p = require(`./${f}`); if (p.version !== process.argv[1]) { console.error(`${f} is ${p.version}, tag is ${process.argv[1]}`); process.exitCode=1; } }' "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Build and smoke (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            runner: windows-latest
+            os: windows
+            arch: x64
+          - label: macos-x64
+            runner: macos-15-intel
+            os: mac
+            arch: x64
+          - label: macos-arm64
+            runner: macos-15
+            os: mac
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            live/package-lock.json
+      - name: Install live server dependencies
+        run: npm ci --prefix live --ignore-scripts --omit=dev
+      - name: Install desktop build dependencies
+        run: npm ci --prefix desktop
+      - name: Check backend lifecycle and local access protections
+        run: node --test live/test/server.test.mjs
+      - name: Validate optional SignPath configuration
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        env:
+          API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNING_POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          APP_CONFIGURATION: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIGURATION }}
+          INSTALLER_CONFIGURATION: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION }}
+        run: |
+          foreach ($name in @('API_TOKEN','ORGANIZATION_ID','PROJECT_SLUG','SIGNING_POLICY','APP_CONFIGURATION','INSTALLER_CONFIGURATION')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "SignPath is enabled but $name is missing." }
+          }
+      - name: Build Windows app folder for optional signing
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        run: npx electron-builder --win dir --x64 --publish never
+        working-directory: desktop
+      - name: Upload Windows app folder for signing
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        id: upload-unsigned-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-app-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/dist/win-unpacked
+          include-hidden-files: true
+          if-no-files-found: error
+      - name: Sign Windows app files with SignPath
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        id: sign-app
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIGURATION }}
+          github-artifact-id: ${{ steps.upload-unsigned-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: desktop/dist/signed-app
+          github-token: ${{ github.token }}
+      - name: Replace app folder with SignPath-signed files
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $app = 'desktop/dist/signed-app/Chánh Điện Tịnh Tâm.exe'
+          if (-not (Test-Path $app) -or -not (Test-Path 'desktop/dist/signed-app/resources/app.asar')) {
+            throw 'SignPath must return the complete app folder with the same archive-root layout.'
+          }
+          if ((Get-AuthenticodeSignature $app).Status -ne 'Valid') { throw 'App signature is missing or invalid.' }
+          Remove-Item 'desktop/dist/win-unpacked' -Recurse -Force
+          Move-Item 'desktop/dist/signed-app' 'desktop/dist/win-unpacked'
+      - name: Build Windows x64 one-click NSIS installer
+        if: matrix.os == 'windows' && (vars.SIGNPATH_ENABLED != 'true' || !startsWith(github.ref, 'refs/tags/'))
+        run: npm run dist:win
+        working-directory: desktop
+      - name: Package signed Windows app as NSIS installer
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        run: npx electron-builder --win nsis --x64 --prepackaged dist/win-unpacked --publish never
+        working-directory: desktop
+      - name: Upload unsigned Windows installer for SignPath
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        id: upload-unsigned-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/dist/*.exe
+          if-no-files-found: error
+      - name: Sign Windows installer with SignPath
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        id: sign-installer
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION }}
+          github-artifact-id: ${{ steps.upload-unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: desktop/dist/signed-installer
+          github-token: ${{ github.token }}
+      - name: Use SignPath-signed Windows installer
+        if: matrix.os == 'windows' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $signed = @(Get-ChildItem 'desktop/dist/signed-installer' -Filter '*.exe' -Recurse)
+          $original = @(Get-ChildItem 'desktop/dist' -Filter '*.exe' -File)
+          if ($signed.Count -ne 1 -or $original.Count -ne 1) { throw 'Expected exactly one original and one signed installer.' }
+          if ((Get-AuthenticodeSignature $signed[0].FullName).Status -ne 'Valid') { throw 'Installer signature is missing or invalid.' }
+          Copy-Item $signed[0].FullName $original[0].FullName -Force
+      - name: Install and smoke test Windows installer
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem 'desktop/dist' -Filter '*.exe' -File)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          $installRoot = Join-Path $env:RUNNER_TEMP 'Cài đặt Chánh Điện'
+          $process = Start-Process $installer[0].FullName -ArgumentList "/S /D=$installRoot" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
+          $env:DESKTOP_APP_PATH = Join-Path $installRoot 'Chánh Điện Tịnh Tâm.exe'
+          $env:SMOKE_OUTPUT_DIR = 'desktop/dist/smoke'
+          try {
+            if (-not (Test-Path $env:DESKTOP_APP_PATH)) { throw 'Installed executable is missing.' }
+            npm --prefix desktop run smoke
+            if ($LASTEXITCODE -ne 0) { throw 'Installed application smoke test failed.' }
+            $desktopLink = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Chánh Điện Tịnh Tâm.lnk'
+            if (-not (Test-Path $desktopLink)) { throw 'Desktop shortcut is missing.' }
+          } finally {
+            $uninstaller = @(Get-ChildItem $installRoot -Filter 'Uninstall*.exe')
+            if ($uninstaller.Count -eq 1) {
+              $removed = Start-Process $uninstaller[0].FullName -ArgumentList '/S' -Wait -PassThru
+              if ($removed.ExitCode -ne 0) { throw 'Uninstaller failed.' }
+            }
+          }
+      - name: Build macOS DMG
+        if: matrix.os == 'mac'
+        run: npm run dist:mac -- --${{ matrix.arch }}
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Install from DMG and smoke test macOS app
+        if: matrix.os == 'mac'
+        shell: bash
+        run: |
+          dmg="$(find desktop/dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          mount="$RUNNER_TEMP/chanh-dien-dmg"
+          install="$RUNNER_TEMP/Cài đặt Chánh Điện"
+          mkdir -p "$mount" "$install"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
+          trap 'hdiutil detach "$mount" || true' EXIT
+          source="$(find "$mount" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$source"
+          app="$install/$(basename "$source")"
+          ditto "$source" "$app"
+          codesign --verify --deep --strict "$app"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          DESKTOP_APP_PATH="$app/Contents/MacOS/$executable" SMOKE_OUTPUT_DIR=desktop/dist/smoke npm --prefix desktop run smoke
+      - name: Save smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.label }}
+          path: desktop/dist/smoke/
+          if-no-files-found: ignore
+      - name: Collect installer artifact
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          if [[ "${{ matrix.os }}" == windows ]]; then
+            find desktop/dist -maxdepth 1 -type f -name '*.exe' -exec cp {} release-assets/ \;
+          else
+            find desktop/dist -maxdepth 1 -type f -name '*.dmg' -exec cp {} release-assets/ \;
+          fi
+          test -n "$(find release-assets -type f -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require an access token for a separate public release repository
+        env:
+          RELEASE_REPOSITORY: ${{ vars.RELEASE_REPOSITORY }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ -n "$RELEASE_REPOSITORY" ] && [ "$RELEASE_REPOSITORY" != "$SOURCE_REPOSITORY" ] && [ -z "$RELEASE_TOKEN" ]; then
+            echo "Set RELEASE_TOKEN with write access to the public RELEASE_REPOSITORY." >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release repository is public
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          RELEASE_REPOSITORY: ${{ vars.RELEASE_REPOSITORY || github.repository }}
+        run: |
+          visibility="$(gh api "repos/$RELEASE_REPOSITORY" --jq .visibility)"
+          test "$visibility" = public || { echo 'The release repository must be public.' >&2; exit 1; }
+      - name: Include matching source and build scripts
+        run: git archive --format=tar.gz --prefix=chanh-dien-source/ -o "release-assets/chanh-dien-source-${GITHUB_REF_NAME}.tar.gz" HEAD
+      - name: Create SHA256SUMS
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+      - name: Publish one GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ vars.RELEASE_REPOSITORY || github.repository }}
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          tag_name: ${{ github.ref_name }}
+          name: Chánh Điện Tịnh Tâm ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            Download the Windows x64 installer or the DMG matching your Mac (x64 for Intel, arm64 for Apple silicon). No Node.js or Bun installation is needed.
+
+            These builds have no Apple Developer ID or notarization. Windows builds are unsigned unless SignPath has been configured; initial OS security prompts may appear.
+
+            Source commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+            The matching source and build scripts are included below, along with SHA256SUMS.
+          files: release-assets/*

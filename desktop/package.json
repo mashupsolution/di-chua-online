@@ -1,0 +1,100 @@
+{
+  "name": "chanh-dien-live-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Desktop launcher for Chánh Điện Tịnh Tâm LIVE",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "icons": "node scripts/icons.cjs",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "dist:mac": "electron-builder --mac dmg --publish never",
+    "smoke": "node scripts/smoke.cjs"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "2.6.2",
+    "electron": "45.2.1",
+    "electron-builder": "26.18.0",
+    "playwright": "1.64.1"
+  },
+  "build": {
+    "appId": "org.tinhtam.chanhdien.live",
+    "productName": "Chánh Điện Tịnh Tâm",
+    "directories": {
+      "buildResources": "icons",
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "backend-worker.cjs",
+      "package.json",
+      "icons/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../live",
+        "to": "live",
+        "filter": [
+          "server.mjs", "control.html", "overlay.html", "package.json"
+        ]
+      },
+      {
+        "from": "../live/node_modules",
+        "to": "live/node_modules",
+        "filter": ["**/*", "!.cache/**", "!.bin/**"]
+      },
+      {
+        "from": "../assets",
+        "to": "assets",
+        "filter": [
+          "**/*"
+        ]
+      },
+      { "from": "THIRD-PARTY-NOTICES.md", "to": "THIRD-PARTY-NOTICES.md" },
+      { "from": "../LICENSE", "to": "PROJECT-LICENSE.txt" }
+    ],
+    "asar": true,
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "win": {
+      "icon": "icons/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Chánh Điện Tịnh Tâm"
+    },
+    "mac": {
+      "icon": "icons/icon.icns",
+      "extendInfo": {
+        "CFBundleName": "Cha\u0301nh \u0110ie\u0323\u0302n Ti\u0323nh Ta\u0302m"
+      },
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "identity": "-",
+      "hardenedRuntime": false,
+      "notarize": false
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-mac-${arch}.dmg"
+    }
+  }
+}

@@ -13,12 +13,14 @@ import { WebSocketServer } from 'ws';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');            // repo root: serves /assets, /live
-const TTS_DIR = path.join(__dirname, 'tts');
-fs.mkdirSync(TTS_DIR, { recursive: true });
-for (const f of fs.readdirSync(TTS_DIR)) { try { fs.unlinkSync(path.join(TTS_DIR, f)); } catch {} }
-const PORT = +process.env.PORT || 3000;
 
+export async function startLiveServer({ host = '127.0.0.1', port = 3000, staticRoot = path.resolve(__dirname, '..'), ttsDir = path.join(__dirname, 'tts'), fallbackPort = false } = {}) {
+const ROOT = path.resolve(staticRoot);
+const TTS_DIR = path.resolve(ttsDir);
+fs.mkdirSync(TTS_DIR, { recursive: true });
+for (const f of fs.readdirSync(TTS_DIR)) { if (/^tts_\d+_\d+\.mp3$/.test(f)) try { fs.unlinkSync(path.join(TTS_DIR, f)); } catch {} }
+let actualPort = port;
+let closed = false;
 /* ------------------------------------------------------------------ state */
 const settings = {
   title: 'Chánh Điện Tịnh Tâm',
@@ -106,25 +108,31 @@ function pickPrayer(){
 const spoken = s => String(s).replace(/[_@.]+/g, ' ').replace(/[^\p{L}\p{N}\s]/gu, '').trim() || 'ẩn danh';
 
 /* ------------------------------------------------------------------ TTS */
-const ttsQueue = []; let ttsBusy = false, ttsSeq = 0;
+const ttsQueue = []; let ttsBusy = false, ttsSeq = 0, ttsClient = null, ttsStream = null, ttsTimer = null;
 function esc(s){ return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[c])); }
 function say(text, meta = {}){ if (ttsQueue.length >= 15) { addLog('Hàng đợi giọng đọc đầy, bỏ qua 1 câu'); return; } ttsQueue.push({ text: String(text).slice(0, 500), meta }); pumpTTS(); }
 async function pumpTTS(){
-  if (ttsBusy || !ttsQueue.length) return; ttsBusy = true;
+  if (closed || ttsBusy || !ttsQueue.length) return; ttsBusy = true;
   const { text, meta } = ttsQueue.shift();
   try {
     const file = `tts_${Date.now()}_${++ttsSeq}.mp3`;
-    const tts = new MsEdgeTTS();
+    const tts = ttsClient = new MsEdgeTTS();
     await tts.setMetadata(settings.voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+    if (closed) return;
     const { audioStream } = tts.toStream(esc(text), { pitch: `${settings.pitch >= 0 ? '+' : ''}${settings.pitch}Hz`, rate: `${settings.rate >= 0 ? '+' : ''}${settings.rate}%` });
+    ttsStream = audioStream;
     const chunks = [];
     await new Promise((res, rej) => { audioStream.on('data', c => chunks.push(c)); audioStream.on('close', res); audioStream.on('error', rej); });
-    try { tts.close(); } catch {}
+    if (closed) return;
     fs.writeFileSync(path.join(TTS_DIR, file), Buffer.concat(chunks));
     broadcast({ t:'tts', url: `/live/tts/${file}`, text, ...meta });
     const old = fs.readdirSync(TTS_DIR).sort(); while (old.length > 40) { try { fs.unlinkSync(path.join(TTS_DIR, old.shift())); } catch {} }
-  } catch (e) { addLog('TTS lỗi: ' + (e?.message || e)); }
-  ttsBusy = false; setTimeout(pumpTTS, 50);
+  } catch (e) { if (!closed) addLog('TTS lỗi: ' + (e?.message || e)); }
+  finally {
+    try { ttsClient?.close(); } catch {}
+    ttsClient = null; ttsStream = null; ttsBusy = false;
+    if (!closed) ttsTimer = setTimeout(pumpTTS, 50);
+  }
 }
 
 const CHANTS = [
@@ -139,20 +147,25 @@ function scheduleChant(){ clearInterval(chantTimer); if (settings.autoChant) cha
 scheduleChant();
 
 /* --------------------------------------------------------------- TikTok */
-let TikTokLib = null;
+let TikTokLib = null, connectGeneration = 0, pendingTikTok = null;
 async function connectTikTok(uniqueId){
   uniqueId = String(uniqueId || '').trim().replace(/^.*tiktok\.com\/@?/i, '').replace(/^@/, '').replace(/\/.*$/, '');
   if (!uniqueId) return;
-  await disconnectTikTok();
+  const generation = ++connectGeneration;
+  const previous = [tiktok, pendingTikTok]; tiktok = null; pendingTikTok = null;
+  for (const conn of new Set(previous.filter(Boolean))) { try { await conn.disconnect(); } catch {} }
+  if (closed || generation !== connectGeneration) return;
   tiktokState = { status: 'connecting', uniqueId, error: '' }; broadcast({ t:'tiktok', ...tiktokState });
   try {
     TikTokLib ||= await import('tiktok-live-connector');
+    if (closed || generation !== connectGeneration) return;
     const { TikTokLiveConnection, WebcastEvent, ControlEvent } = TikTokLib;
-    const conn = new TikTokLiveConnection(uniqueId, { enableExtendedGiftInfo: true, processInitialData: false });
+    const conn = pendingTikTok = new TikTokLiveConnection(uniqueId, { enableExtendedGiftInfo: true, processInitialData: false });
+    const on = (event, handler) => conn.on(event, (...args) => { if (!closed && generation === connectGeneration) handler(...args); });
     const av = u => u?.profilePicture?.url?.[0] || u?.profilePicture?.urlList?.[0] || u?.avatarThumb?.urlList?.[0] || u?.avatarThumb?.url?.[0] || '';
     const nm = u => u?.nickname || u?.uniqueId || 'ẩn danh';
-    conn.on(WebcastEvent.CHAT, d => onChat(d.user?.uniqueId || d.user?.userId, nm(d.user), d.comment, av(d.user)));
-    conn.on(WebcastEvent.GIFT, d => {
+    on(WebcastEvent.CHAT, d => onChat(d.user?.uniqueId || d.user?.userId, nm(d.user), d.comment, av(d.user)));
+    on(WebcastEvent.GIFT, d => {
       const type = d.giftDetails?.giftType ?? d.extendedGiftInfo?.type;
       if (type === 1 && !d.repeatEnd) return;                       // streak still running
       const gname = d.giftDetails?.giftName || d.extendedGiftInfo?.name || 'quà';
@@ -160,21 +173,29 @@ async function connectTikTok(uniqueId){
       onGift(d.user?.uniqueId || d.user?.userId, nm(d.user), gname, d.repeatCount || 1, dia, av(d.user));
       addLog(`🎁 ${nm(d.user)} tặng ${gname} x${d.repeatCount || 1}`);
     });
-    conn.on(WebcastEvent.MEMBER, d => { if (settings.joinOnEnter) seat(d.user?.uniqueId, nm(d.user), { avatar: av(d.user) }); });
-    conn.on(WebcastEvent.LIKE, d => broadcast({ t:'like', id: d.user?.uniqueId, n: d.likeCount || 1 }));
-    conn.on(ControlEvent.DISCONNECTED, () => { tiktokState = { ...tiktokState, status: 'disconnected' }; broadcast({ t:'tiktok', ...tiktokState }); addLog('TikTok: mất kết nối'); });
-    conn.on(ControlEvent.ERROR, e => addLog('TikTok lỗi: ' + (e?.info || e?.message || e)));
+    on(WebcastEvent.MEMBER, d => { if (settings.joinOnEnter) seat(d.user?.uniqueId, nm(d.user), { avatar: av(d.user) }); });
+    on(WebcastEvent.LIKE, d => broadcast({ t:'like', id: d.user?.uniqueId, n: d.likeCount || 1 }));
+    on(ControlEvent.DISCONNECTED, () => { tiktokState = { ...tiktokState, status: 'disconnected' }; broadcast({ t:'tiktok', ...tiktokState }); addLog('TikTok: mất kết nối'); });
+    on(ControlEvent.ERROR, e => addLog('TikTok lỗi: ' + (e?.info || e?.message || e)));
     const st = await conn.connect();
-    tiktok = conn;
+    if (closed || generation !== connectGeneration) { try { await conn.disconnect(); } catch {} return; }
+    pendingTikTok = null; tiktok = conn;
     tiktokState = { status: 'connected', uniqueId, error: '', roomId: st?.roomId || '' };
     addLog(`✅ Đã kết nối live @${uniqueId}`);
   } catch (e) {
+    if (closed || generation !== connectGeneration) return;
+    pendingTikTok = null;
     tiktokState = { status: 'error', uniqueId, error: String(e?.message || e) };
     addLog(`❌ Không kết nối được @${uniqueId}: ${tiktokState.error}`);
   }
   broadcast({ t:'tiktok', ...tiktokState });
 }
-async function disconnectTikTok(){ if (tiktok){ try { await tiktok.disconnect(); } catch {} tiktok = null; } tiktokState = { status:'idle', uniqueId:'', error:'' }; broadcast({ t:'tiktok', ...tiktokState }); }
+async function disconnectTikTok(){
+  ++connectGeneration;
+  const connections = new Set([tiktok, pendingTikTok].filter(Boolean)); tiktok = null; pendingTikTok = null;
+  tiktokState = { status:'idle', uniqueId:'', error:'' }; if (!closed) broadcast({ t:'tiktok', ...tiktokState });
+  for (const conn of connections) { try { await conn.disconnect(); } catch {} }
+}
 
 /* ------------------------------------------------------------- test data */
 const DEMO_NAMES = ['Diệu Hạnh','Minh Tâm','Thiện Đức','Huệ An','Tịnh Nhã','Quảng Trí','Chơn Như','Pháp Hỷ','Nguyên Thanh','Tâm Đăng','Diệu Liên','Trí Hải','Phước Lộc','Hạnh Nguyện','Như Ý','Bảo Châu','Thanh Lương','Từ Tâm','An Lạc','Giác Hoa','Tuệ Minh','Liên Hương','Thu Hà','Ngọc Lan','Đức Anh','Hải Đăng','Mai Anh','Phương Thảo','Trung Kiên','Quang Huy','Bảo Ngọc','Diệu Linh'];
@@ -252,17 +273,19 @@ function setBots(on, n, pace){
 //    same browser cannot send control commands
 //  • static files: only /assets and /live, no dot-files, no node_modules, no server source, no path escapes
 //  • no TikTok password, cookie or session is ever used or stored; only public room events are read
-const HOST = process.env.HOST || '127.0.0.1';
 const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
   '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
-const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
-const okHost = h => ALLOWED_HOSTS.has(String(h || '').toLowerCase());
+const okHost = h => new Set([`localhost:${actualPort}`, `127.0.0.1:${actualPort}`, `[::1]:${actualPort}`]).has(String(h || '').toLowerCase());
 const SEP = path.sep;
 function resolveStatic(urlPath){
   let p = urlPath === '/' ? '/live/control.html' : urlPath;
   if (!/^\/(assets|live)\//.test(p)) return null;
   if (p.split('/').some(seg => seg.startsWith('.') || seg === 'node_modules')) return null;
   if (/\.(mjs|json|md|log)$/i.test(p) && !p.startsWith('/assets/')) return null;      // never serve server code / package files
+  if (p.startsWith('/live/tts/')) {
+    const name = p.slice('/live/tts/'.length);
+    return /^tts_\d+_\d+\.mp3$/.test(name) ? path.join(TTS_DIR, name) : null;
+  }
   const file = path.normalize(path.join(ROOT, p));
   if (!file.startsWith(ROOT + SEP)) return null;
   return file;
@@ -273,7 +296,8 @@ const server = http.createServer((req, res) => {
   let p; try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
   const file = resolveStatic(p);
   if (!file) { res.writeHead(404).end('not found'); return; }
-  fs.stat(file, (err, st) => {
+  const inspect = p.startsWith('/live/tts/') ? fs.lstat : fs.stat;
+  inspect(file, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
       'Cache-Control': p.startsWith('/live/tts/') ? 'no-store' : 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
@@ -285,9 +309,11 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024,
   verifyClient: ({ origin, req }) => {
     if (!okHost(req.headers.host)) return false;
     if (!origin) return true;                                   // OBS / non-browser clients send no Origin
-    try { return okHost(new URL(origin).host); } catch { return false; }
+    try { const u = new URL(origin); return u.protocol === 'http:' && okHost(u.host); } catch { return false; }
   } });
-function broadcast(msg, only){ const s = JSON.stringify(msg); for (const c of wss.clients) if (c.readyState === 1 && (!only || c.role === only)) c.send(s); }
+// The HTTP server reports bind errors to both listeners; startup handles them below.
+wss.on('error', () => {});
+function broadcast(msg, only){ if (closed) return; const s = JSON.stringify(msg); for (const c of wss.clients) if (c.readyState === 1 && (!only || c.role === only)) c.send(s); }
 wss.on('connection', (ws, req) => {
   ws.role = new URL(req.url, 'http://x').searchParams.get('role') === 'control' ? 'control' : 'overlay';
   ws.send(JSON.stringify(snapshot()));
@@ -297,4 +323,32 @@ wss.on('connection', (ws, req) => {
     try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('Lệnh lỗi: ' + e.message); }
   });
 });
-server.listen(PORT, HOST, () => addLog(`Server chạy tại http://localhost:${PORT}  ·  Bảng điều khiển: http://localhost:${PORT}/live/control.html  ·  Overlay: http://localhost:${PORT}/live/overlay.html`));
+const listen = p => new Promise((resolve, reject) => {
+  const onError = err => { server.off('listening', onListening); reject(err); };
+  const onListening = () => { server.off('error', onError); resolve(); };
+  server.once('error', onError); server.once('listening', onListening); server.listen(p, host);
+});
+try { await listen(port); } catch (err) {
+  if (fallbackPort && port !== 0 && err.code === 'EADDRINUSE') {
+    try { await listen(0); } catch (fallbackError) { clearInterval(chantTimer); throw fallbackError; }
+  } else { clearInterval(chantTimer); throw err; }
+}
+actualPort = server.address().port;
+const origin = `http://127.0.0.1:${actualPort}`;
+addLog(`Server chạy tại ${origin}  ·  Bảng điều khiển: ${origin}/live/control.html  ·  Overlay: ${origin}/live/overlay.html`);
+return { origin, close: async () => {
+  if (closed) return;
+  closed = true; clearInterval(chantTimer); clearInterval(botTimer); clearTimeout(ttsTimer); ttsQueue.length = 0;
+  try { ttsStream?.destroy(); } catch {}
+  try { ttsClient?.close(); } catch {}
+  await disconnectTikTok();
+  for (const client of wss.clients) client.terminate();
+  await new Promise(resolve => wss.close(resolve));
+  await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+} };
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startLiveServer({ host: process.env.HOST || '127.0.0.1', port: Number(process.env.PORT) || 3000 })
+    .catch(err => { console.error('Không thể khởi động máy chủ:', err); process.exitCode = 1; });
+}

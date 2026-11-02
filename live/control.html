@@ -60,6 +60,7 @@ button.red{background:var(--red);border-color:#b84a33}
     <div class="row"><input id="uid" placeholder="@tenkenhcuaban" autocomplete="off"><button class="primary" id="btnConnect">Kết nối</button><button id="btnDisconnect">Ngắt</button></div>
     <p class="hint">Chỉ đọc sự kiện công khai của phòng live (bình luận, quà, tim). Không cần mật khẩu hay cookie TikTok. Phải bật LIVE trước rồi mới kết nối.</p>
     <button class="gold" id="btnOverlay">Mở màn hình overlay 9:16</button>
+    <button id="btnCopyOverlay">Sao chép liên kết overlay</button>
     <p class="hint">Trong TikTok LIVE Studio: Add source → Window capture → chọn cửa sổ overlay. Bấm "bật âm thanh" một lần trong cửa sổ đó.</p>
     <h2>Trong sân chùa</h2>
     <div id="people"><table><tbody id="peopleBody"><tr><td class="hint">Chưa có ai</td><td></td></tr></tbody></table></div>
@@ -168,6 +169,15 @@ $('btnConnect').onclick = () => send('connect', { uniqueId: $('uid').value });
 $('uid').onkeydown = e => { if (e.key==='Enter') send('connect', { uniqueId: $('uid').value }); };
 $('btnDisconnect').onclick = () => send('disconnect');
 $('btnOverlay').onclick = () => window.open('/live/overlay.html', 'overlay916', 'width=540,height=960');
+$('btnCopyOverlay').onclick = async () => {
+  const url = new URL('/live/overlay.html', location.href).href;
+  try {
+    await navigator.clipboard.writeText(url);
+    $('btnCopyOverlay').textContent = 'Đã sao chép liên kết';
+  } catch {
+    window.prompt('Sao chép liên kết overlay:', url);
+  }
+};
 $('btnChat').onclick = () => send('chat', { name: $('simName').value, text: $('simText').value });
 document.querySelectorAll('[data-gift]').forEach(b => b.onclick = () => send('gift', { name: $('simName').value, gift: b.dataset.gift, diamonds: +b.dataset.dia, count: 1 }));
 document.querySelectorAll('[data-fill]').forEach(b => b.onclick = () => send('fill', { n: +b.dataset.fill }));
