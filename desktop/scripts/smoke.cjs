@@ -40,6 +40,31 @@ function portIsOpen(port) {
   });
 }
 
+async function checkOverlayStage(overlay, label) {
+  let dimensions;
+  try {
+    await expect.poll(async () => {
+      dimensions = await overlay.evaluate(() => {
+        const rect = document.querySelector('#stage').getBoundingClientRect();
+        return { viewport: { width: innerWidth, height: innerHeight },
+          stage: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+      });
+      const { viewport, stage } = dimensions;
+      const tolerance = 1;
+      return stage.width > 0 && stage.height > 0 &&
+        Math.abs(stage.width / stage.height - 9 / 16) < 0.002 &&
+        stage.x >= -tolerance && stage.y >= -tolerance &&
+        stage.x + stage.width <= viewport.width + tolerance &&
+        stage.y + stage.height <= viewport.height + tolerance &&
+        Math.abs(stage.x * 2 + stage.width - viewport.width) <= tolerance &&
+        Math.abs(stage.y * 2 + stage.height - viewport.height) <= tolerance &&
+        (Math.abs(stage.width - viewport.width) <= tolerance || Math.abs(stage.height - viewport.height) <= tolerance);
+    }, { timeout: 5000 }).toBe(true);
+  } catch (error) {
+    throw new Error(`Overlay stage must be visible, centered, and 9:16 ${label}; measured ${JSON.stringify(dimensions)}`, { cause: error });
+  }
+}
+
 async function main() {
   await fs.mkdir(output, { recursive: true });
   const userData = await fs.mkdtemp(path.join(os.tmpdir(), 'chanh-dien-smoke-'));
@@ -72,8 +97,16 @@ async function main() {
     const overlay = await opened;
     await overlay.waitForURL(`${origin}/live/overlay.html`);
     await expect(overlay.locator('#count')).toHaveText('15/24');
-    const dimensions = await overlay.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-    assert.ok(Math.abs(dimensions.width / dimensions.height - 9 / 16) < 0.002, 'Overlay content must stay 9:16 on smaller displays.');
+    await checkOverlayStage(overlay, 'at launch');
+    const originalViewport = await overlay.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    await application.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find(window => new URL(window.webContents.getURL()).pathname === '/live/overlay.html');
+      const [width, height] = window.getContentSize();
+      window.setContentSize(Math.max(1, Math.floor(width * 0.75)), Math.max(1, Math.floor(height * 0.75)));
+    });
+    await expect.poll(() => overlay.evaluate(() => ({ width: innerWidth, height: innerHeight })))
+      .not.toEqual(originalViewport);
+    await checkOverlayStage(overlay, 'after resizing smaller');
     await overlay.waitForFunction(() => Object.values(A).every(image => image.complete && image.naturalWidth > 0));
     const preferences = await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({
       pathname: new URL(window.webContents.getURL()).pathname,

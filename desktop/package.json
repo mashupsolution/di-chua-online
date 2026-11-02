@@ -94,6 +94,7 @@
       "notarize": false
     },
     "dmg": {
+      "backgroundColor": "#ffffff",
       "artifactName": "${productName}-${version}-mac-${arch}.dmg"
     }
   }
